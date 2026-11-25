@@ -69,39 +69,43 @@ jobs:
         run: test -f dist/index.html || { echo "dist/index.html missing after pnpm build" >&2; exit 1; }
 
       # ---------- 2. 编译后端 dbx-web，glibc 2.28 封顶 ----------
-      # 在 manylinux_2_28 aarch64 容器内用 cargo-zigbuild 编译：
-      #   - 宿主系统 glibc 就是 2.28，从源头杜绝高版本符号
-      #   - zig 作为 linker，target 带 .2.28 明确封顶符号版本
-      #   - 前端 dist 通过 volume 挂载进容器，embed-static 编进二进制
-      - name: Build dbx-web (glibc 2.28, manylinux container)
+      # 走上游 mcp-release / plugin-cli-release 已验证的模式：
+      # 在 ubuntu-22.04-arm 宿主上用 cargo-zigbuild，target 带 .2.28 明确封顶
+      # 符号版本（zig 作为 linker 按 glibc 2.28 解析符号）。第 8 步再用
+      # objdump 扫描全部 GLIBC_x.y 符号，出现 > 2.28 直接 fail 兜底。
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: ${{ env.TARGET }}
+
+      - name: Setup Python (for cargo-zigbuild)
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+
+      - name: Install cargo-zigbuild + lld
         shell: bash
         run: |
-          docker run --rm \
-            --user "$(id -u):$(id -g)" \
-            -e HOME=/tmp/dbx-build-home \
-            -e CARGO_INCREMENTAL=0 \
-            -e CARGO_TARGET_DIR=/workspace/target/arm64-glibc228 \
-            -e RUSTFLAGS="-C link-arg=-fuse-ld=lld -C target-feature=+crt-static" \
-            -v "${{ github.workspace }}:/workspace" \
-            -w /workspace \
-            quay.io/pypa/manylinux_2_28_aarch64 \
-            bash -lc '
-              set -euo pipefail
-              mkdir -p "$HOME"
-              # lld 用于加速链接；fontconfig 开发头供 rust 原生依赖编译
-              (yum install -y lld fontconfig-devel gcc-c++ glibc-devel 2>/dev/null || yum install -y lld fontconfig-devel gcc-c++ 2>/dev/null || true)
-              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
-                | sh -s -- -y --profile minimal --default-toolchain ${{ env.RUST_TOOLCHAIN }} \
-                    --target aarch64-unknown-linux-gnu
-              source "$HOME/.cargo/env"
-              python3 -m pip install --no-cache-dir ziglang==0.14.0 cargo-zigbuild==0.23.0
-              echo "Building dbx-web for ${{ env.TARGET }}.${{ env.GLIBC_VERSION }} ..."
-              cargo zigbuild --locked --release \
-                -p dbx-web \
-                --target ${{ env.TARGET }}.${{ env.GLIBC_VERSION }} \
-                --no-default-features \
-                --features "embed-static,duckdb-sidecar,dynamodb,mq-admin,dbx-core/sqlite-bundled"
-            '
+          set -euo pipefail
+          python3 -m pip install --no-cache-dir ziglang==0.14.0 cargo-zigbuild==0.23.0
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends lld libfontconfig1-dev
+          # 上游 dbx-web 的原生依赖需要 fontconfig 头文件（system-fonts 默认特性），
+          # 这里 --no-default-features 不含 system-fonts，但留着头文件以防传递依赖需要。
+
+      - name: Build dbx-web (zigbuild, glibc 2.28 ceiling)
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/arm64-glibc228
+          RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+        run: |
+          set -euo pipefail
+          echo "Building dbx-web for ${{ env.TARGET }}.${{ env.GLIBC_VERSION }} ..."
+          cargo zigbuild --locked --release \
+            -p dbx-web \
+            --target ${{ env.TARGET }}.${{ env.GLIBC_VERSION }} \
+            --no-default-features \
+            --features "embed-static,duckdb-sidecar,dynamodb,mq-admin,dbx-core/sqlite-bundled"
 
       - name: Locate + verify backend binary
         id: backend
